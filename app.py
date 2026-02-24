@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,7 @@ from fiona.crs import CRS as FionaCRS
 # -----------------------------
 # Ayarlar (performans için)
 # -----------------------------
-BATCH_SIZE = 500
+DEFAULT_BATCH_SIZE = 500
 DEFAULT_LAYER_NAME = "footprints"
 OUTPUT_CRS_EPSG = 4326  # WGS84
 
@@ -44,6 +45,9 @@ FIXED_FIELDS = [
 ]
 
 
+# -----------------------------
+# Yardımcılar
+# -----------------------------
 def _localname(tag: str) -> str:
     if not isinstance(tag, str):
         return ""
@@ -104,16 +108,16 @@ def ensure_closed_ring(coords: List[Tuple[float, float]]) -> List[Tuple[float, f
     return coords
 
 
-def transform_ring(
-    coords_xy: Sequence[Tuple[float, float]],
-    transformer: Transformer
-) -> List[Tuple[float, float]]:
+def transform_ring(coords_xy: Sequence[Tuple[float, float]], transformer: Transformer) -> List[Tuple[float, float]]:
     xs = [c[0] for c in coords_xy]
     ys = [c[1] for c in coords_xy]
     lon, lat = transformer.transform(xs, ys)
     return list(zip(lon, lat))
 
 
+# -----------------------------
+# GML okuma
+# -----------------------------
 def extract_gml_id(elem: etree._Element) -> Optional[str]:
     for k, v in elem.attrib.items():
         if _localname(k) == "id":
@@ -192,6 +196,7 @@ def parse_ring_coords(ring_elem: Optional[etree._Element]) -> Optional[List[Tupl
                 step = None
 
         if step is None:
+            # heuristik
             if len(nums) % 3 == 0 and len(nums) >= 12:
                 step = 3
             elif len(nums) % 2 == 0:
@@ -270,7 +275,9 @@ def parse_polygon(poly_elem: etree._Element) -> Optional[Tuple[List[Tuple[float,
     return exterior_coords, holes
 
 
-def extract_lod0_footprint_polygons(building_elem: etree._Element) -> List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
+def extract_lod0_footprint_polygons(
+    building_elem: etree._Element,
+) -> List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
     polygons: List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
     for fp in building_elem.iter():
         ln = _localname(fp.tag)
@@ -283,6 +290,9 @@ def extract_lod0_footprint_polygons(building_elem: etree._Element) -> List[Tuple
     return polygons
 
 
+# -----------------------------
+# Fiona schema
+# -----------------------------
 def build_fiona_schema() -> dict:
     return {"geometry": "MultiPolygon", "properties": {name: ftype for name, ftype in FIXED_FIELDS}}
 
@@ -299,6 +309,7 @@ def export_to_gpkg(
     input_files: Sequence[Path],
     output_gpkg: Path,
     layer_name: str,
+    batch_size: int,
     progress_cb,
     stop_flag: threading.Event,
 ) -> ExportStats:
@@ -407,7 +418,7 @@ def export_to_gpkg(
                             buffer.append({"type": "Feature", "geometry": geom, "properties": props})
                             stats.features_written += 1
 
-                            if len(buffer) >= BATCH_SIZE:
+                            if len(buffer) >= batch_size:
                                 dst.writerecords(buffer)
                                 buffer.clear()
 
@@ -423,6 +434,7 @@ def export_to_gpkg(
                 log_error(f"[FAIL] {gml_path} -> {repr(e)}")
 
             stats.files_done = idx
+
             elapsed = time.time() - start_time
             avg = (elapsed / stats.files_done) if stats.files_done else 0.0
             eta = avg * (stats.files_total - stats.files_done)
@@ -446,6 +458,35 @@ def fmt_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+def prepare_job_dir() -> Path:
+    temp_root = Path(".streamlit_tmp")
+    temp_root.mkdir(parents=True, exist_ok=True)
+    job_dir = temp_root / f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def extract_zip_to_dir(zip_path: Path, out_dir: Path) -> List[Path]:
+    """Zip'i out_dir altına çıkarır, içindeki .gml dosyalarının Path listesini döner."""
+    gml_paths: List[Path] = []
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # Güvenlik: Zip Slip'e karşı basit kontrol
+        for member in zf.infolist():
+            name = member.filename
+            if not name or name.endswith("/"):
+                continue
+            # normalize & block absolute/parent traversal
+            p = Path(name)
+            if p.is_absolute() or ".." in p.parts:
+                continue
+            # extract
+            zf.extract(member, out_dir)
+
+    # extract sonrası .gml topla
+    gml_paths = sorted([p for p in out_dir.rglob("*.gml") if p.is_file()])
+    return gml_paths
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -456,38 +497,46 @@ with st.sidebar:
     st.header("Ayarlar")
     layer_name = st.text_input("Layer adı", value=DEFAULT_LAYER_NAME)
     base_name = st.text_input("Çıktı dosya adı (timestamp eklenecek)", value="footprints")
-    batch_size = st.number_input("Batch size", min_value=50, max_value=5000, value=BATCH_SIZE, step=50)
-    st.caption("Not: Çok büyük batch daha hızlı olabilir ama RAM tüketir.")
+    batch_size = st.number_input("Batch size", min_value=50, max_value=5000, value=DEFAULT_BATCH_SIZE, step=50)
+    st.caption("İpucu: Büyük batch daha hızlı olabilir ama RAM tüketir.")
 
-# global BATCH_SIZE override
-BATCH_SIZE = int(batch_size)
-
-# stop flag
 if "stop_flag" not in st.session_state:
     st.session_state.stop_flag = threading.Event()
 
-st.subheader("1) GML Dosyalarını Yükle")
-uploads = st.file_uploader("Çoklu .gml seçin", type=["gml"], accept_multiple_files=True)
+mode = st.radio(
+    "Girdi modu seçin",
+    ["ZIP (önerilen)", "Çoklu GML"],
+    horizontal=True,
+)
 
-colA, colB = st.columns(2)
-with colA:
-    start = st.button("Başlat", disabled=not uploads)
-with colB:
-    cancel = st.button("Durdur")
+uploads_gml = None
+upload_zip = None
 
-log_box = st.empty()
+if mode == "ZIP (önerilen)":
+    st.subheader("1) ZIP yükle")
+    upload_zip = st.file_uploader("İçinde .gml dosyaları olan .zip seçin", type=["zip"], accept_multiple_files=False)
+else:
+    st.subheader("1) GML dosyalarını yükle")
+    uploads_gml = st.file_uploader("Çoklu .gml seçin", type=["gml"], accept_multiple_files=True)
+
+col1, col2 = st.columns(2)
+start_disabled = (upload_zip is None) if mode == "ZIP (önerilen)" else (not uploads_gml)
+start = col1.button("Başlat", disabled=start_disabled)
+cancel = col2.button("Durdur")
+
 progress_bar = st.progress(0)
 status_line = st.empty()
+log_box = st.empty()
 
 if cancel:
     st.session_state.stop_flag.set()
     status_line.warning("Durdurma istendi (mevcut dosya bitince durur).")
 
-def run_job(temp_dir: Path, input_paths: List[Path], out_path: Path, layer: str):
+def run_job(input_paths: List[Path], out_path: Path):
     logs: List[str] = []
 
     def progress_cb(stats: ExportStats, elapsed: float, eta: float, current_file: str, file_failed: bool):
-        pct = (stats.files_done / stats.files_total * 100) if stats.files_total else 0
+        pct = (stats.files_done / stats.files_total * 100) if stats.files_total else 0.0
         progress_bar.progress(min(stats.files_done / max(stats.files_total, 1), 1.0))
         status_line.info(
             f"%{pct:0.1f} ({stats.files_done}/{stats.files_total}) | "
@@ -502,7 +551,8 @@ def run_job(temp_dir: Path, input_paths: List[Path], out_path: Path, layer: str)
     stats = export_to_gpkg(
         input_files=input_paths,
         output_gpkg=out_path,
-        layer_name=layer,
+        layer_name=(layer_name.strip() or DEFAULT_LAYER_NAME),
+        batch_size=int(batch_size),
         progress_cb=progress_cb,
         stop_flag=st.session_state.stop_flag,
     )
@@ -510,31 +560,45 @@ def run_job(temp_dir: Path, input_paths: List[Path], out_path: Path, layer: str)
 
 if start:
     st.session_state.stop_flag.clear()
-
-    # temp workspace
-    temp_root = Path(st.session_state.get("temp_root", ""))
-    if not temp_root or not temp_root.exists():
-        # Streamlit Cloud dahil çalışsın diye yerel bir temp klasör:
-        temp_root = Path(".streamlit_tmp")
-        temp_root.mkdir(parents=True, exist_ok=True)
-        st.session_state.temp_root = str(temp_root)
-
-    # input files -> temp
-    job_dir = temp_root / f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir = prepare_job_dir()
 
     input_paths: List[Path] = []
-    for uf in uploads:
-        p = job_dir / uf.name
-        p.write_bytes(uf.getbuffer())
-        input_paths.append(p)
+    input_label = ""
+
+    if mode == "ZIP (önerilen)":
+        # zip'i diske yaz
+        zip_path = job_dir / (upload_zip.name if upload_zip else "input.zip")
+        zip_path.write_bytes(upload_zip.getbuffer())  # type: ignore
+
+        extract_dir = job_dir / "unzipped"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        input_paths = extract_zip_to_dir(zip_path, extract_dir)
+        input_label = f"ZIP içinden {len(input_paths)} adet .gml bulundu"
+        st.info(input_label)
+
+        if not input_paths:
+            st.error("ZIP içinde .gml bulunamadı. Lütfen içeriği kontrol edin.")
+            st.stop()
+
+    else:
+        # gml'leri diske yaz
+        assert uploads_gml is not None
+        for uf in uploads_gml:
+            p = job_dir / uf.name
+            p.write_bytes(uf.getbuffer())
+            input_paths.append(p)
+        input_paths = sorted(input_paths)
+        input_label = f"{len(input_paths)} adet .gml yüklendi"
+        st.info(input_label)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = job_dir / f"{base_name.strip() or 'footprints'}_{ts}.gpkg"
+    out_name = f"{(base_name.strip() or 'footprints')}_{ts}.gpkg"
+    out_path = job_dir / out_name
 
-    st.info(f"{len(input_paths)} dosya yüklendi. Çıktı: {out_path.name}")
+    st.caption(f"Çıktı: {out_path.name}")
 
-    stats = run_job(job_dir, input_paths, out_path, layer_name.strip() or DEFAULT_LAYER_NAME)
+    stats = run_job(input_paths, out_path)
 
     stopped = st.session_state.stop_flag.is_set()
     if stopped:
@@ -551,7 +615,6 @@ if start:
         }
     )
 
-    # download buttons
     gpkg_bytes = out_path.read_bytes() if out_path.exists() else None
     log_path = out_path.with_suffix(".log.txt")
     log_bytes = log_path.read_bytes() if log_path.exists() else None
