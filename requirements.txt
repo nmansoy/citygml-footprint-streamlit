@@ -1,0 +1,4 @@
+streamlit>=1.35
+lxml>=5.0
+pyproj>=3.6
+fiona>=1.9

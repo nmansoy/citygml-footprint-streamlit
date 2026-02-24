@@ -1,0 +1,8 @@
+.streamlit_tmp/
+__pycache__/
+*.pyc
+*.gpkg
+*.log.txt
+.DS_Store
+.idea/
+.vscode/
